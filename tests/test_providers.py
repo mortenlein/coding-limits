@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import sys
 import unittest
-from io import BytesIO
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -241,103 +240,118 @@ class ClaudeProviderTests(unittest.TestCase):
 # ── Gemini ────────────────────────────────────────────────────────────────────
 
 class GeminiProviderTests(unittest.TestCase):
-    def _make_provider(self, **kwargs) -> GeminiProvider:
-        defaults = {"api_key": "test-api-key"}
+    def _make_provider(self, tmp_home: Path, **kwargs) -> GeminiProvider:
+        defaults = {"gemini_home": str(tmp_home), "daily_limit": 100, "rpm_limit": 10}
         defaults.update(kwargs)
         return GeminiProvider(**defaults)
 
-    def _make_http_error(self, code: int, body: dict, headers: dict | None = None) -> Exception:
-        from urllib.error import HTTPError
-        body_bytes = json.dumps(body).encode()
-        mock_headers = MagicMock()
-        mock_headers.get = lambda k, d=None: (headers or {}).get(k, d)
-        exc = HTTPError(
-            url="https://example.com",
-            code=code,
-            msg="Error",
-            hdrs=mock_headers,
-            fp=BytesIO(body_bytes),
-        )
-        return exc
+    def _write_logs(self, tmp_home: Path, project: str, entries: list[dict]) -> None:
+        log_dir = tmp_home / "tmp" / project
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "logs.json").write_text(json.dumps(entries))
 
-    def test_raises_on_empty_api_key(self):
+    def _ts(self, delta_seconds: int = 0) -> str:
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc)
+        t = now + datetime.timedelta(seconds=delta_seconds)
+        return t.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    def test_raises_if_gemini_home_missing(self):
         with self.assertRaises(RuntimeError) as ctx:
-            GeminiProvider(api_key="")
-        self.assertIn("api_key", str(ctx.exception).lower())
+            GeminiProvider(gemini_home="/nonexistent/path/xyz").fetch()
+        self.assertIn("not found", str(ctx.exception))
 
-    @patch("providers.gemini.urlopen")
-    def test_fetch_success(self, mock_urlopen):
-        mock_resp = MagicMock()
-        mock_resp.__enter__ = lambda s: s
-        mock_resp.__exit__ = MagicMock(return_value=False)
-        mock_resp.read.return_value = json.dumps({"totalTokens": 1}).encode()
-        mock_resp.headers = MagicMock()
-
-        import io
-        class FakeResp:
-            def __enter__(self): return self
-            def __exit__(self, *a): pass
-            def read(self): return json.dumps({"totalTokens": 1}).encode()
-            headers = MagicMock()
-        mock_urlopen.return_value = FakeResp()
-
-        data = self._make_provider().fetch()
+    @patch("providers.gemini.shutil.which", return_value="/usr/bin/gemini")
+    def test_fetch_no_requests(self, _which):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_home = Path(tmp)
+            (tmp_home / "tmp").mkdir()
+            data = self._make_provider(tmp_home).fetch()
         self.assertTrue(data["ok"])
-        self.assertEqual(data["source"], "gemini-api")
-        self.assertIsNone(data["shortWindow"]["usedPercent"])
-        self.assertIsNone(data["longWindow"]["usedPercent"])
+        self.assertEqual(data["source"], "gemini-cli-logs")
+        self.assertEqual(data["shortWindow"]["usedPercent"], 0)
+        self.assertEqual(data["longWindow"]["usedPercent"], 0)
+        self.assertEqual(data["shortWindow"]["remainingPercent"], 100)
         self.assertIsNone(data["error"])
 
-    @patch("providers.gemini.urlopen")
-    def test_fetch_rate_limited_rpm(self, mock_urlopen):
-        from urllib.error import HTTPError
-        err_body = {
-            "error": {
-                "code": 429,
-                "details": [{
-                    "metadata": {"quota_id": "GenerateRequestsPerMinutePerProjectPerModel"}
-                }]
-            }
-        }
-        body_bytes = json.dumps(err_body).encode()
-        mock_headers = MagicMock()
-        mock_headers.get = lambda k, d=None: "30" if k == "Retry-After" else d
-        exc = HTTPError("https://x", 429, "Too Many Requests", mock_headers, BytesIO(body_bytes))
-        mock_urlopen.side_effect = exc
+    @patch("providers.gemini.shutil.which", return_value="/usr/bin/gemini")
+    def test_counts_requests_today(self, _which):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_home = Path(tmp)
+            self._write_logs(tmp_home, "proj", [
+                {"type": "user", "messageId": 0, "message": "hello", "timestamp": self._ts(-3600), "sessionId": "a"},
+                {"type": "user", "messageId": 1, "message": "world", "timestamp": self._ts(-120), "sessionId": "a"},
+            ])
+            data = self._make_provider(tmp_home, daily_limit=10).fetch()
+        self.assertEqual(data["longWindow"]["usedPercent"], 20)  # 2/10 = 20%
+        self.assertEqual(data["longWindow"]["remainingPercent"], 80)
 
-        data = self._make_provider().fetch()
-        self.assertFalse(data["ok"])
-        self.assertEqual(data["shortWindow"]["usedPercent"], 100)
-        self.assertEqual(data["shortWindow"]["remainingPercent"], 0)
-        self.assertEqual(data["rateLimitReachedType"], "rpm")
+    @patch("providers.gemini.shutil.which", return_value="/usr/bin/gemini")
+    def test_counts_rpm(self, _which):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_home = Path(tmp)
+            self._write_logs(tmp_home, "proj", [
+                {"type": "user", "messageId": 0, "message": "a", "timestamp": self._ts(-10), "sessionId": "a"},
+                {"type": "user", "messageId": 1, "message": "b", "timestamp": self._ts(-5), "sessionId": "a"},
+                {"type": "user", "messageId": 2, "message": "c", "timestamp": self._ts(-3600), "sessionId": "a"},  # old
+            ])
+            data = self._make_provider(tmp_home, rpm_limit=10).fetch()
+        self.assertEqual(data["shortWindow"]["usedPercent"], 20)  # 2/10 = 20%
 
-    @patch("providers.gemini.urlopen")
-    def test_fetch_rate_limited_rpd(self, mock_urlopen):
-        from urllib.error import HTTPError
-        err_body = {"error": {"code": 429, "details": [{"metadata": {"quota_id": "GenerateRequestsPerDay"}}]}}
-        body_bytes = json.dumps(err_body).encode()
-        mock_headers = MagicMock()
-        mock_headers.get = lambda k, d=None: d
-        exc = HTTPError("https://x", 429, "Too Many Requests", mock_headers, BytesIO(body_bytes))
-        mock_urlopen.side_effect = exc
+    @patch("providers.gemini.shutil.which", return_value="/usr/bin/gemini")
+    def test_ignores_slash_commands(self, _which):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_home = Path(tmp)
+            self._write_logs(tmp_home, "proj", [
+                {"type": "user", "messageId": 0, "message": "/stats", "timestamp": self._ts(-10), "sessionId": "a"},
+                {"type": "user", "messageId": 1, "message": "/quit", "timestamp": self._ts(-5), "sessionId": "a"},
+                {"type": "user", "messageId": 2, "message": "real prompt", "timestamp": self._ts(-3), "sessionId": "a"},
+            ])
+            data = self._make_provider(tmp_home, daily_limit=10, rpm_limit=10).fetch()
+        self.assertEqual(data["longWindow"]["usedPercent"], 10)  # 1/10 = 10%
 
-        data = self._make_provider().fetch()
-        self.assertFalse(data["ok"])
+    @patch("providers.gemini.shutil.which", return_value="/usr/bin/gemini")
+    def test_aggregates_multiple_projects(self, _which):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_home = Path(tmp)
+            self._write_logs(tmp_home, "proj1", [
+                {"type": "user", "messageId": 0, "message": "a", "timestamp": self._ts(-10), "sessionId": "a"},
+            ])
+            self._write_logs(tmp_home, "proj2", [
+                {"type": "user", "messageId": 0, "message": "b", "timestamp": self._ts(-5), "sessionId": "b"},
+            ])
+            data = self._make_provider(tmp_home, daily_limit=10).fetch()
+        self.assertEqual(data["longWindow"]["usedPercent"], 20)  # 2/10 = 20%
+
+    @patch("providers.gemini.shutil.which", return_value="/usr/bin/gemini")
+    def test_handles_malformed_log_file(self, _which):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_home = Path(tmp)
+            bad_dir = tmp_home / "tmp" / "bad"
+            bad_dir.mkdir(parents=True)
+            (bad_dir / "logs.json").write_text("not valid json")
+            data = self._make_provider(tmp_home).fetch()
+        self.assertTrue(data["ok"])  # bad file is skipped, not fatal
+
+    @patch("providers.gemini.shutil.which", return_value="/usr/bin/gemini")
+    def test_clamps_at_100_percent(self, _which):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_home = Path(tmp)
+            entries = [
+                {"type": "user", "messageId": i, "message": f"msg {i}", "timestamp": self._ts(-i*5), "sessionId": "a"}
+                for i in range(20)
+            ]
+            self._write_logs(tmp_home, "proj", entries)
+            data = self._make_provider(tmp_home, daily_limit=5).fetch()
         self.assertEqual(data["longWindow"]["usedPercent"], 100)
-        self.assertEqual(data["rateLimitReachedType"], "rpd")
-
-    @patch("providers.gemini.urlopen")
-    def test_fetch_raises_on_non_429_error(self, mock_urlopen):
-        from urllib.error import HTTPError
-        body_bytes = b'{"error": {"code": 403, "message": "forbidden"}}'
-        mock_headers = MagicMock()
-        mock_headers.get = lambda k, d=None: d
-        exc = HTTPError("https://x", 403, "Forbidden", mock_headers, BytesIO(body_bytes))
-        mock_urlopen.side_effect = exc
-
-        with self.assertRaises(RuntimeError) as ctx:
-            self._make_provider().fetch()
-        self.assertIn("403", str(ctx.exception))
+        self.assertEqual(data["longWindow"]["remainingPercent"], 0)
 
 
 # ── Config ────────────────────────────────────────────────────────────────────

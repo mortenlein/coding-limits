@@ -55,9 +55,9 @@ def load_config() -> dict[str, Any]:
             },
             "gemini": {
                 "enabled": False,
-                "api_key": "",
-                "model": "gemini-2.0-flash",
-                "timeout_seconds": 15,
+                "gemini_home": "",
+                "daily_limit": 1000,
+                "rpm_limit": 15,
             },
         },
     }
@@ -95,8 +95,10 @@ def validate_config(config: dict[str, Any]) -> None:
         log.warning("CLAUDE_ENABLED=true but CLAUDE_SESSION_KEY is empty — Claude provider will fail")
 
     gemini_cfg = config["providers"]["gemini"]
-    if gemini_cfg.get("enabled") and not gemini_cfg.get("api_key"):
-        log.warning("GEMINI_ENABLED=true but GEMINI_API_KEY is empty — Gemini provider will fail")
+    if gemini_cfg.get("enabled"):
+        import shutil
+        if not shutil.which("gemini"):
+            log.warning("gemini binary not found in PATH — Gemini provider will fail at runtime")
 
 
 def deep_merge(base: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
@@ -147,9 +149,9 @@ def apply_env_overrides(config: dict[str, Any]) -> None:
 
     gemini_cfg = config["providers"]["gemini"]
     gemini_cfg["enabled"] = parse_env_bool("GEMINI_ENABLED", bool(gemini_cfg["enabled"]))
-    gemini_cfg["api_key"] = os.environ.get("GEMINI_API_KEY", gemini_cfg["api_key"])
-    gemini_cfg["model"] = os.environ.get("GEMINI_MODEL", gemini_cfg["model"])
-    gemini_cfg["timeout_seconds"] = parse_env_int("GEMINI_TIMEOUT_SECONDS", int(gemini_cfg["timeout_seconds"]))
+    gemini_cfg["gemini_home"] = os.environ.get("GEMINI_CLI_HOME", gemini_cfg["gemini_home"])
+    gemini_cfg["daily_limit"] = parse_env_int("GEMINI_DAILY_LIMIT", int(gemini_cfg["daily_limit"]))
+    gemini_cfg["rpm_limit"] = parse_env_int("GEMINI_RPM_LIMIT", int(gemini_cfg["rpm_limit"]))
 
 
 def fetch_with_retry(provider: Any, name: str, max_attempts: int = 2) -> dict[str, Any]:
@@ -199,12 +201,12 @@ def build_snapshot(config: dict[str, Any]) -> dict[str, Any]:
         ),
         (
             "gemini",
-            "gemini-api",
+            "gemini-cli-logs",
             GeminiProvider,
             {
-                "api_key": providers_cfg.get("gemini", {}).get("api_key", ""),
-                "model": providers_cfg.get("gemini", {}).get("model", "gemini-2.0-flash"),
-                "timeout_seconds": int(providers_cfg.get("gemini", {}).get("timeout_seconds", 15)),
+                "gemini_home": providers_cfg.get("gemini", {}).get("gemini_home", ""),
+                "daily_limit": int(providers_cfg.get("gemini", {}).get("daily_limit", 1000)),
+                "rpm_limit": int(providers_cfg.get("gemini", {}).get("rpm_limit", 15)),
             },
         ),
     ]

@@ -24,7 +24,7 @@ A lightweight HTTP gateway that polls AI subscription usage APIs and exposes a s
 |---|---|---|
 | **OpenAI Codex** | Local CLI (`~/.codex`) | 5h and 7d rate limit windows with % remaining |
 | **Claude** | Browser session key (`sessionKey` cookie) | 5h and 7d rate limit windows, overage credits |
-| **Gemini** | Google AI Studio API key | Reachability check; rate limit details on 429 |
+| **Gemini** | Gemini CLI (`~/.gemini/`) — no API key needed | Daily (RPD) and per-minute (RPM) usage from local session logs |
 
 ---
 
@@ -119,17 +119,22 @@ CLAUDE_SESSION_KEY=sk-ant-sid-...
 
 ### Enabling Gemini
 
-1. Visit [Google AI Studio](https://aistudio.google.com) and create an API key
-2. Add to your env file:
+The Gemini provider reads from the local Gemini CLI session logs (`~/.gemini/tmp/*/logs.json`) — **no API key, no API calls, no cost**. It counts actual prompts sent today and in the last minute and compares them against the free-tier limits.
+
+Prerequisites:
+1. Install [Gemini CLI](https://github.com/google-gemini/gemini-cli) and log in with your Google account: `gemini`
+2. Enable it in your env file:
 
 ```
 GEMINI_ENABLED=true
-GEMINI_API_KEY=AIza...
+# Optional overrides (defaults match the personal free tier):
+# GEMINI_DAILY_LIMIT=1000
+# GEMINI_RPM_LIMIT=15
 ```
 
-The Gemini provider makes a lightweight `countTokens` probe request on each snapshot. It reports `ok: true` when the key is valid and quota is available. If a 429 is returned, the snapshot includes which window (RPM or RPD) was exhausted and when it resets.
+The gateway reads the CLI's log files on the same machine. If the `gemini` binary is not in PATH, or `~/.gemini/` doesn't exist, the provider will report an error.
 
-> **Note:** Google does not expose remaining quota in successful API responses, so `usedPercent` and `remainingPercent` will be `null` when not rate-limited.
+> **Limits note:** Free-tier limits (1000 RPD / 15 RPM for Gemini 2.0 Flash) are configured as defaults. Adjust `GEMINI_DAILY_LIMIT` / `GEMINI_RPM_LIMIT` if your account has different limits.
 
 ### Securing the endpoint
 
@@ -192,9 +197,10 @@ Requires `X-Gauge-Token` header if `ACCESS_TOKEN` is set. Calls all enabled prov
     "gemini": {
       "enabled": true,
       "ok": true,
-      "source": "gemini-api",
-      "shortWindow": { "label": "RPM", "usedPercent": null, "remainingPercent": null, "windowDurationMins": 1, "resetsAt": null },
-      "longWindow":  { "label": "RPD", "usedPercent": null, "remainingPercent": null, "windowDurationMins": 1440, "resetsAt": null },
+      "source": "gemini-cli-logs",
+      "planType": "personal",
+      "shortWindow": { "label": "RPM", "usedPercent": 6.7, "remainingPercent": 93, "windowDurationMins": 1, "resetsAt": null },
+      "longWindow":  { "label": "RPD", "usedPercent": 12.0, "remainingPercent": 88, "windowDurationMins": 1440, "resetsAt": null },
       "error": null
     }
   }
