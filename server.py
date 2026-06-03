@@ -55,9 +55,12 @@ def load_config() -> dict[str, Any]:
             },
             "gemini": {
                 "enabled": False,
-                "gemini_home": "",
+                "creds_file": "",
+                "history_file": "",
+                "model": "gemini-2.0-flash",
                 "daily_limit": 1000,
                 "rpm_limit": 15,
+                "timeout_seconds": 15,
             },
         },
     }
@@ -95,10 +98,15 @@ def validate_config(config: dict[str, Any]) -> None:
         log.warning("CLAUDE_ENABLED=true but CLAUDE_SESSION_KEY is empty — Claude provider will fail")
 
     gemini_cfg = config["providers"]["gemini"]
-    if gemini_cfg.get("enabled"):
-        import shutil
-        if not shutil.which("gemini"):
-            log.warning("gemini binary not found in PATH — Gemini provider will fail at runtime")
+    if gemini_cfg.get("enabled") and not gemini_cfg.get("creds_file"):
+        from pathlib import Path as _Path
+        default = _Path.home() / ".gemini" / "oauth_creds.json"
+        if not default.exists():
+            log.warning(
+                "GEMINI_ENABLED=true but no credentials found at %s — "
+                "copy ~/.gemini/oauth_creds.json from your dev machine or set GEMINI_CREDS_FILE",
+                default,
+            )
 
 
 def deep_merge(base: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
@@ -149,9 +157,12 @@ def apply_env_overrides(config: dict[str, Any]) -> None:
 
     gemini_cfg = config["providers"]["gemini"]
     gemini_cfg["enabled"] = parse_env_bool("GEMINI_ENABLED", bool(gemini_cfg["enabled"]))
-    gemini_cfg["gemini_home"] = os.environ.get("GEMINI_CLI_HOME", gemini_cfg["gemini_home"])
+    gemini_cfg["creds_file"] = os.environ.get("GEMINI_CREDS_FILE", gemini_cfg["creds_file"])
+    gemini_cfg["history_file"] = os.environ.get("GEMINI_HISTORY_FILE", gemini_cfg["history_file"])
+    gemini_cfg["model"] = os.environ.get("GEMINI_MODEL", gemini_cfg["model"])
     gemini_cfg["daily_limit"] = parse_env_int("GEMINI_DAILY_LIMIT", int(gemini_cfg["daily_limit"]))
     gemini_cfg["rpm_limit"] = parse_env_int("GEMINI_RPM_LIMIT", int(gemini_cfg["rpm_limit"]))
+    gemini_cfg["timeout_seconds"] = parse_env_int("GEMINI_TIMEOUT_SECONDS", int(gemini_cfg["timeout_seconds"]))
 
 
 def fetch_with_retry(provider: Any, name: str, max_attempts: int = 2) -> dict[str, Any]:
@@ -201,12 +212,15 @@ def build_snapshot(config: dict[str, Any]) -> dict[str, Any]:
         ),
         (
             "gemini",
-            "gemini-cli-logs",
+            "gemini-oauth",
             GeminiProvider,
             {
-                "gemini_home": providers_cfg.get("gemini", {}).get("gemini_home", ""),
+                "creds_file": providers_cfg.get("gemini", {}).get("creds_file", ""),
+                "history_file": providers_cfg.get("gemini", {}).get("history_file", ""),
+                "model": providers_cfg.get("gemini", {}).get("model", "gemini-2.0-flash"),
                 "daily_limit": int(providers_cfg.get("gemini", {}).get("daily_limit", 1000)),
                 "rpm_limit": int(providers_cfg.get("gemini", {}).get("rpm_limit", 15)),
+                "timeout_seconds": int(providers_cfg.get("gemini", {}).get("timeout_seconds", 15)),
             },
         ),
     ]

@@ -240,118 +240,166 @@ class ClaudeProviderTests(unittest.TestCase):
 # ── Gemini ────────────────────────────────────────────────────────────────────
 
 class GeminiProviderTests(unittest.TestCase):
-    def _make_provider(self, tmp_home: Path, **kwargs) -> GeminiProvider:
-        defaults = {"gemini_home": str(tmp_home), "daily_limit": 100, "rpm_limit": 10}
+    def _creds_file(self, tmp_dir: Path, expiry_offset_ms: int = 3_600_000) -> Path:
+        import time
+        creds = {
+            "access_token": "ya29.test-token",
+            "refresh_token": "1//test-refresh-token",
+            "token_type": "Bearer",
+            "expiry_date": int(time.time() * 1000) + expiry_offset_ms,
+            "client_id": "test-client-id.apps.googleusercontent.com",
+            "client_secret": "test-client-secret",
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }
+        p = tmp_dir / "oauth_creds.json"
+        p.write_text(json.dumps(creds))
+        return p
+
+    def _make_provider(self, creds_file: Path, **kwargs) -> GeminiProvider:
+        defaults = {"creds_file": str(creds_file)}
         defaults.update(kwargs)
         return GeminiProvider(**defaults)
 
-    def _write_logs(self, tmp_home: Path, project: str, entries: list[dict]) -> None:
-        log_dir = tmp_home / "tmp" / project
-        log_dir.mkdir(parents=True, exist_ok=True)
-        (log_dir / "logs.json").write_text(json.dumps(entries))
+    def _fake_urlopen_ok(self):
+        class FakeResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def read(self): return json.dumps({"totalTokens": 1}).encode()
+            headers = MagicMock()
+        return FakeResp()
 
-    def _ts(self, delta_seconds: int = 0) -> str:
-        import datetime
-        now = datetime.datetime.now(datetime.timezone.utc)
-        t = now + datetime.timedelta(seconds=delta_seconds)
-        return t.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
-    def test_raises_if_gemini_home_missing(self):
+    def test_raises_if_creds_missing(self):
         with self.assertRaises(RuntimeError) as ctx:
-            GeminiProvider(gemini_home="/nonexistent/path/xyz").fetch()
-        self.assertIn("not found", str(ctx.exception))
+            GeminiProvider(creds_file="/nonexistent/oauth_creds.json").fetch()
+        self.assertIn("not found", str(ctx.exception).lower())
 
-    @patch("providers.gemini.shutil.which", return_value="/usr/bin/gemini")
-    def test_fetch_no_requests(self, _which):
+    @patch("providers.gemini.urlopen")
+    def test_fetch_success(self, mock_urlopen):
         import tempfile
+        mock_urlopen.return_value = self._fake_urlopen_ok()
         with tempfile.TemporaryDirectory() as tmp:
-            tmp_home = Path(tmp)
-            (tmp_home / "tmp").mkdir()
-            data = self._make_provider(tmp_home).fetch()
+            creds_file = self._creds_file(Path(tmp))
+            # Point history_file at nonexistent path so counts come back null
+            data = self._make_provider(
+                creds_file, history_file=str(Path(tmp) / "no-history.jsonl")
+            ).fetch()
         self.assertTrue(data["ok"])
-        self.assertEqual(data["source"], "gemini-cli-logs")
-        self.assertEqual(data["shortWindow"]["usedPercent"], 0)
-        self.assertEqual(data["longWindow"]["usedPercent"], 0)
-        self.assertEqual(data["shortWindow"]["remainingPercent"], 100)
+        self.assertEqual(data["source"], "gemini-oauth")
+        self.assertIsNone(data["shortWindow"]["usedPercent"])
+        self.assertIsNone(data["longWindow"]["usedPercent"])
         self.assertIsNone(data["error"])
 
-    @patch("providers.gemini.shutil.which", return_value="/usr/bin/gemini")
-    def test_counts_requests_today(self, _which):
+    @patch("providers.gemini.urlopen")
+    def test_refreshes_expired_token(self, mock_urlopen):
         import tempfile
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_home = Path(tmp)
-            self._write_logs(tmp_home, "proj", [
-                {"type": "user", "messageId": 0, "message": "hello", "timestamp": self._ts(-3600), "sessionId": "a"},
-                {"type": "user", "messageId": 1, "message": "world", "timestamp": self._ts(-120), "sessionId": "a"},
-            ])
-            data = self._make_provider(tmp_home, daily_limit=10).fetch()
-        self.assertEqual(data["longWindow"]["usedPercent"], 20)  # 2/10 = 20%
-        self.assertEqual(data["longWindow"]["remainingPercent"], 80)
+        call_count = [0]
+        refresh_body = {"access_token": "ya29.fresh", "expires_in": 3600, "token_type": "Bearer"}
+        count_body = {"totalTokens": 1}
 
-    @patch("providers.gemini.shutil.which", return_value="/usr/bin/gemini")
-    def test_counts_rpm(self, _which):
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_home = Path(tmp)
-            self._write_logs(tmp_home, "proj", [
-                {"type": "user", "messageId": 0, "message": "a", "timestamp": self._ts(-10), "sessionId": "a"},
-                {"type": "user", "messageId": 1, "message": "b", "timestamp": self._ts(-5), "sessionId": "a"},
-                {"type": "user", "messageId": 2, "message": "c", "timestamp": self._ts(-3600), "sessionId": "a"},  # old
-            ])
-            data = self._make_provider(tmp_home, rpm_limit=10).fetch()
-        self.assertEqual(data["shortWindow"]["usedPercent"], 20)  # 2/10 = 20%
+        class FakeResp:
+            def __init__(self, body): self._body = body
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def read(self): return json.dumps(self._body).encode()
+            headers = MagicMock()
 
-    @patch("providers.gemini.shutil.which", return_value="/usr/bin/gemini")
-    def test_ignores_slash_commands(self, _which):
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_home = Path(tmp)
-            self._write_logs(tmp_home, "proj", [
-                {"type": "user", "messageId": 0, "message": "/stats", "timestamp": self._ts(-10), "sessionId": "a"},
-                {"type": "user", "messageId": 1, "message": "/quit", "timestamp": self._ts(-5), "sessionId": "a"},
-                {"type": "user", "messageId": 2, "message": "real prompt", "timestamp": self._ts(-3), "sessionId": "a"},
-            ])
-            data = self._make_provider(tmp_home, daily_limit=10, rpm_limit=10).fetch()
-        self.assertEqual(data["longWindow"]["usedPercent"], 10)  # 1/10 = 10%
+        def side_effect(req, timeout=None):
+            call_count[0] += 1
+            return FakeResp(refresh_body if call_count[0] == 1 else count_body)
 
-    @patch("providers.gemini.shutil.which", return_value="/usr/bin/gemini")
-    def test_aggregates_multiple_projects(self, _which):
-        import tempfile
+        mock_urlopen.side_effect = side_effect
         with tempfile.TemporaryDirectory() as tmp:
-            tmp_home = Path(tmp)
-            self._write_logs(tmp_home, "proj1", [
-                {"type": "user", "messageId": 0, "message": "a", "timestamp": self._ts(-10), "sessionId": "a"},
-            ])
-            self._write_logs(tmp_home, "proj2", [
-                {"type": "user", "messageId": 0, "message": "b", "timestamp": self._ts(-5), "sessionId": "b"},
-            ])
-            data = self._make_provider(tmp_home, daily_limit=10).fetch()
-        self.assertEqual(data["longWindow"]["usedPercent"], 20)  # 2/10 = 20%
+            creds_file = self._creds_file(Path(tmp), expiry_offset_ms=-1000)
+            data = self._make_provider(creds_file).fetch()
+        self.assertTrue(data["ok"])
+        self.assertEqual(call_count[0], 2)
 
-    @patch("providers.gemini.shutil.which", return_value="/usr/bin/gemini")
-    def test_handles_malformed_log_file(self, _which):
+    @patch("providers.gemini.urlopen")
+    def test_fetch_rate_limited_rpm(self, mock_urlopen):
         import tempfile
+        from io import BytesIO
+        from urllib.error import HTTPError
+        err_body = json.dumps({"error": {"code": 429, "details": [
+            {"metadata": {"quota_id": "GenerateRequestsPerMinutePerModel"}}
+        ]}}).encode()
+        hdr = MagicMock()
+        hdr.get = lambda k, d=None: "30" if k == "Retry-After" else d
+        mock_urlopen.side_effect = HTTPError("https://x", 429, "Too Many Requests", hdr, BytesIO(err_body))
         with tempfile.TemporaryDirectory() as tmp:
-            tmp_home = Path(tmp)
-            bad_dir = tmp_home / "tmp" / "bad"
-            bad_dir.mkdir(parents=True)
-            (bad_dir / "logs.json").write_text("not valid json")
-            data = self._make_provider(tmp_home).fetch()
-        self.assertTrue(data["ok"])  # bad file is skipped, not fatal
+            creds_file = self._creds_file(Path(tmp))
+            data = self._make_provider(creds_file).fetch()
+        self.assertFalse(data["ok"])
+        self.assertEqual(data["shortWindow"]["usedPercent"], 100)
+        self.assertEqual(data["rateLimitReachedType"], "rpm")
 
-    @patch("providers.gemini.shutil.which", return_value="/usr/bin/gemini")
-    def test_clamps_at_100_percent(self, _which):
+    @patch("providers.gemini.urlopen")
+    def test_fetch_rate_limited_rpd(self, mock_urlopen):
         import tempfile
+        from io import BytesIO
+        from urllib.error import HTTPError
+        err_body = json.dumps({"error": {"code": 429, "details": [
+            {"metadata": {"quota_id": "GenerateRequestsPerDay"}}
+        ]}}).encode()
+        hdr = MagicMock()
+        hdr.get = lambda k, d=None: d
+        mock_urlopen.side_effect = HTTPError("https://x", 429, "Too Many Requests", hdr, BytesIO(err_body))
         with tempfile.TemporaryDirectory() as tmp:
-            tmp_home = Path(tmp)
-            entries = [
-                {"type": "user", "messageId": i, "message": f"msg {i}", "timestamp": self._ts(-i*5), "sessionId": "a"}
-                for i in range(20)
-            ]
-            self._write_logs(tmp_home, "proj", entries)
-            data = self._make_provider(tmp_home, daily_limit=5).fetch()
+            creds_file = self._creds_file(Path(tmp))
+            data = self._make_provider(creds_file).fetch()
+        self.assertFalse(data["ok"])
         self.assertEqual(data["longWindow"]["usedPercent"], 100)
-        self.assertEqual(data["longWindow"]["remainingPercent"], 0)
+        self.assertEqual(data["rateLimitReachedType"], "rpd")
+
+    @patch("providers.gemini.urlopen")
+    def test_raises_on_non_429_error(self, mock_urlopen):
+        import tempfile
+        from io import BytesIO
+        from urllib.error import HTTPError
+        body = json.dumps({"error": {"code": 403, "message": "forbidden"}}).encode()
+        hdr = MagicMock()
+        hdr.get = lambda k, d=None: d
+        mock_urlopen.side_effect = HTTPError("https://x", 403, "Forbidden", hdr, BytesIO(body))
+        with tempfile.TemporaryDirectory() as tmp:
+            creds_file = self._creds_file(Path(tmp))
+            with self.assertRaises(RuntimeError) as ctx:
+                self._make_provider(creds_file).fetch()
+        self.assertIn("403", str(ctx.exception))
+
+    @patch("providers.gemini.urlopen")
+    def test_history_counts_shown_when_available(self, mock_urlopen):
+        import tempfile, time
+        mock_urlopen.return_value = self._fake_urlopen_ok()
+        now_ms = int(time.time() * 1000)
+        lines = [
+            json.dumps({"display": "hello", "timestamp": now_ms - 30_000, "workspace": "/x"}),
+            json.dumps({"display": "world", "timestamp": now_ms - 3600_000, "workspace": "/x"}),
+            json.dumps({"display": "/stats", "timestamp": now_ms - 10_000, "workspace": "/x"}),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            creds_file = self._creds_file(Path(tmp))
+            history_file = Path(tmp) / "history.jsonl"
+            history_file.write_text("\n".join(lines))
+            data = self._make_provider(
+                creds_file, history_file=str(history_file),
+                daily_limit=10, rpm_limit=10,
+            ).fetch()
+        self.assertTrue(data["ok"])
+        # 2 real messages today (both < 24h ago), 1 within last minute
+        self.assertEqual(data["longWindow"]["usedPercent"], 20)   # 2/10
+        self.assertEqual(data["shortWindow"]["usedPercent"], 10)  # 1/10
+
+    @patch("providers.gemini.urlopen")
+    def test_history_missing_gives_null_percent(self, mock_urlopen):
+        import tempfile
+        mock_urlopen.return_value = self._fake_urlopen_ok()
+        with tempfile.TemporaryDirectory() as tmp:
+            creds_file = self._creds_file(Path(tmp))
+            data = self._make_provider(
+                creds_file, history_file=str(Path(tmp) / "nonexistent.jsonl"),
+            ).fetch()
+        self.assertTrue(data["ok"])
+        self.assertIsNone(data["longWindow"]["usedPercent"])
+        self.assertIsNone(data["shortWindow"]["usedPercent"])
 
 
 # ── Config ────────────────────────────────────────────────────────────────────

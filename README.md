@@ -24,7 +24,7 @@ A lightweight HTTP gateway that polls AI subscription usage APIs and exposes a s
 |---|---|---|
 | **OpenAI Codex** | Local CLI (`~/.codex`) | 5h and 7d rate limit windows with % remaining |
 | **Claude** | Browser session key (`sessionKey` cookie) | 5h and 7d rate limit windows, overage credits |
-| **Gemini** | Gemini CLI (`~/.gemini/`) — no API key needed | Daily (RPD) and per-minute (RPM) usage from local session logs |
+| **Gemini** | OAuth credentials from `~/.gemini/oauth_creds.json` — no API key | Reachability + rate limit details on 429; auto-refreshes the access token |
 
 ---
 
@@ -119,22 +119,25 @@ CLAUDE_SESSION_KEY=sk-ant-sid-...
 
 ### Enabling Gemini
 
-The Gemini provider reads from the local Gemini CLI session logs (`~/.gemini/tmp/*/logs.json`) — **no API key, no API calls, no cost**. It counts actual prompts sent today and in the last minute and compares them against the free-tier limits.
+The Gemini provider uses the same OAuth credentials as the Gemini CLI — **no API key, no billing**. It calls the Gemini API as your Google account's personal free quota and auto-refreshes the access token using the stored refresh token.
 
-Prerequisites:
-1. Install [Gemini CLI](https://github.com/google-gemini/gemini-cli) and log in with your Google account: `gemini`
-2. Enable it in your env file:
+**One-time setup on the gateway machine:**
+
+```bash
+# Copy credentials from your dev machine to the gateway server
+scp ~/.gemini/oauth_creds.json mole@ash:/etc/gemini-oauth-creds.json
+```
+
+Then add to `/etc/coding-limits.env`:
 
 ```
 GEMINI_ENABLED=true
-# Optional overrides (defaults match the personal free tier):
-# GEMINI_DAILY_LIMIT=1000
-# GEMINI_RPM_LIMIT=15
+GEMINI_CREDS_FILE=/etc/gemini-oauth-creds.json
 ```
 
-The gateway reads the CLI's log files on the same machine. If the `gemini` binary is not in PATH, or `~/.gemini/` doesn't exist, the provider will report an error.
+The provider auto-refreshes the access token (valid 1 hour) using the refresh token in the file. When Google eventually invalidates the refresh token (rare — typically only on password change or account revocation), re-copy the credentials file from your dev machine.
 
-> **Limits note:** Free-tier limits (1000 RPD / 15 RPM for Gemini 2.0 Flash) are configured as defaults. Adjust `GEMINI_DAILY_LIMIT` / `GEMINI_RPM_LIMIT` if your account has different limits.
+> **Note:** Google does not expose remaining quota in successful API responses, so `usedPercent` will be `null` when not rate-limited. The bars on the display will show `--`. If a 429 is hit, the relevant window (RPM or RPD) fills to 100% with a reset countdown.
 
 ### Securing the endpoint
 
