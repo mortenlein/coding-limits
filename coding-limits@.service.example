@@ -1,0 +1,18 @@
+[Unit]
+Description=coding-limits gateway for %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/opt/coding-limits/gateway
+EnvironmentFile=/etc/coding-limits.env
+ExecStart=/usr/bin/python3 /opt/coding-limits/gateway/server.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
